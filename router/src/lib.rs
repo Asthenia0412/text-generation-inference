@@ -706,51 +706,94 @@ impl ChatCompletion {
         tool_calls: Option<Vec<ToolCall>>,
         prompt_tokens: u32,
     ) -> Self {
-        let message = match (output, tool_calls) {
-            (Some(content), None) => OutputMessage::ChatMessage(TextMessage {
-                role: "assistant".into(),
-                content,
-                ..Default::default()
-            }),
-            (None, Some(tool_calls)) => OutputMessage::ToolCall(ToolCallMessage {
-                role: "assistant".to_string(),
-                tool_calls,
-            }),
-            (Some(output), Some(_)) => {
-                warn!("Received both chat and tool call");
-                OutputMessage::ChatMessage(TextMessage {
-                    role: "assistant".into(),
-                    content: output,
-                    ..Default::default()
-                })
-            }
-            (None, None) => {
-                warn!("Didn't receive an answer");
-                OutputMessage::ChatMessage(TextMessage {
-                    role: "assistant".into(),
-                    content: "".to_string(),
-                    ..Default::default()
-                })
-            }
-        };
+        let completion_tokens = details.generated_tokens;
+        let choice = build_chat_choice(
+            0,
+            output,
+            details,
+            return_logprobs,
+            tool_calls,
+        );
         Self {
             id: String::new(),
             created,
             model,
             system_fingerprint,
-            choices: vec![ChatCompletionComplete {
-                index: 0,
-                message,
-                logprobs: return_logprobs
-                    .then(|| ChatCompletionLogprobs::from((details.tokens, details.top_tokens))),
-                finish_reason: details.finish_reason.format(true),
-            }],
+            choices: vec![choice],
             usage: Usage {
                 prompt_tokens,
-                completion_tokens: details.generated_tokens,
-                total_tokens: prompt_tokens + details.generated_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
             },
         }
+    }
+
+    /// Build a ChatCompletion with pre-built choices and aggregated usage.
+    /// Used when `n > 1` to fan out multiple independent generations.
+    pub(crate) fn new_with_choices(
+        model: String,
+        system_fingerprint: String,
+        created: u64,
+        choices: Vec<ChatCompletionComplete>,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    ) -> Self {
+        Self {
+            id: String::new(),
+            created,
+            model,
+            system_fingerprint,
+            choices,
+            usage: Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            },
+        }
+    }
+}
+
+/// Build a single ChatCompletionComplete choice from one generation result.
+pub(crate) fn build_chat_choice(
+    index: u32,
+    output: Option<String>,
+    details: Details,
+    return_logprobs: bool,
+    tool_calls: Option<Vec<ToolCall>>,
+) -> ChatCompletionComplete {
+    let message = match (output, tool_calls) {
+        (Some(content), None) => OutputMessage::ChatMessage(TextMessage {
+            role: "assistant".into(),
+            content,
+            ..Default::default()
+        }),
+        (None, Some(tool_calls)) => OutputMessage::ToolCall(ToolCallMessage {
+            role: "assistant".to_string(),
+            tool_calls,
+        }),
+        (Some(output), Some(_)) => {
+            warn!("Received both chat and tool call");
+            OutputMessage::ChatMessage(TextMessage {
+                role: "assistant".into(),
+                content: output,
+                ..Default::default()
+            })
+        }
+        (None, None) => {
+            warn!("Didn't receive an answer");
+            OutputMessage::ChatMessage(TextMessage {
+                role: "assistant".into(),
+                content: "".to_string(),
+                ..Default::default()
+            })
+        }
+    };
+    ChatCompletionComplete {
+        index,
+        message,
+        logprobs: return_logprobs
+            .then(|| ChatCompletionLogprobs::from((details.tokens, details.top_tokens))),
+        finish_reason: details.finish_reason.format(true),
     }
 }
 #[derive(Clone, Serialize, ToSchema)]
@@ -867,7 +910,6 @@ pub(crate) struct ChatRequest {
     #[schema(default = "1024", example = "32")]
     pub max_tokens: Option<u32>,
 
-    /// UNUSED
     /// How many chat completion choices to generate for each input message. Note that you will be charged based on the
     /// number of generated tokens across all of the choices. Keep n as 1 to minimize costs.
     #[serde(default)]

@@ -15,12 +15,12 @@ use crate::sagemaker::{
 use crate::validation::ValidationError;
 use crate::vertex::vertex_compatibility;
 use crate::{
-    usage_stats, BestOfSequence, Details, ErrorResponse, FinishReason, FunctionName,
-    GenerateParameters, GenerateRequest, GenerateResponse, GrammarType, HubModelInfo,
-    HubProcessorConfig, HubTokenizerConfig, Info, Message, MessageChunk, MessageContent,
-    OutputMessage, PrefillToken, SimpleToken, StreamDetails, StreamOptions, StreamResponse,
-    TextMessage, Token, TokenizeResponse, Tokenizer, ToolCallDelta, ToolCallMessage, Url, Usage,
-    Validation,
+    usage_stats, BestOfSequence, build_chat_choice, Details, ErrorResponse, FinishReason,
+    FunctionName, GenerateParameters, GenerateRequest, GenerateResponse, GrammarType,
+    HubModelInfo, HubProcessorConfig, HubTokenizerConfig, Info, Message, MessageChunk,
+    MessageContent, OutputMessage, PrefillToken, SimpleToken, StreamDetails, StreamOptions,
+    StreamResponse, TextMessage, Token, TokenizeResponse, Tokenizer, ToolCallDelta,
+    ToolCallMessage, Url, Usage, Validation,
 };
 use crate::{
     ChatCompletion, ChatCompletionChoice, ChatCompletionChunk, ChatCompletionComplete,
@@ -1170,7 +1170,7 @@ pub(crate) async fn chat_completions(
     Extension(compute_type): Extension<ComputeType>,
     Extension(info): Extension<Info>,
     Extension(context): Extension<Option<opentelemetry::Context>>,
-    Json(mut chat): Json<ChatRequest>,
+    Json(chat): Json<ChatRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let span = tracing::Span::current();
     if let Some(context) = context {
@@ -1183,14 +1183,24 @@ pub(crate) async fn chat_completions(
         stream,
         stream_options,
         logprobs,
+        n,
         ..
     } = chat.clone();
 
+    // Validate n parameter
+    let n = n.unwrap_or(1);
+    if n == 0 || n > 64 {
+        metrics::counter!("tgi_request_failure", "err" => "validation").increment(1);
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResponse {
+                error: format!("`n` must be between 1 and 64. Given: {}", n),
+                error_type: "validation".to_string(),
+            }),
+        ));
+    }
+
     tracing::debug!("Got chat_template {:?}", infer.chat_template);
-    let id = chat.next_tool_call_id();
-    let (generate_request, using_tools): (GenerateRequest, bool) =
-        chat.clone().try_into_generate(&infer)?;
-    span.record("parameters", format!("{:?}", generate_request.parameters));
     let logprobs = logprobs.unwrap_or_default();
 
     // extract model id from request if specified
@@ -1199,7 +1209,70 @@ pub(crate) async fn chat_completions(
         Some(m_id) => m_id.to_string(),
     };
     let system_fingerprint = format!("{}-{}", info.version, info.docker_label.unwrap_or("native"));
-    // switch on stream
+
+    // --- Single generation (n == 1) ---
+    if n == 1 {
+        return run_chat_single(
+            infer,
+            compute_type,
+            chat,
+            span,
+            stream,
+            stream_options,
+            logprobs,
+            model_id,
+            system_fingerprint,
+        )
+        .await;
+    }
+
+    // --- Fan-out multiple independent generations (n > 1) ---
+    if stream {
+        run_chat_stream_n(
+            infer,
+            compute_type,
+            chat,
+            span,
+            stream_options,
+            logprobs,
+            model_id,
+            system_fingerprint,
+            n,
+        )
+        .await
+    } else {
+        run_chat_non_stream_n(
+            infer,
+            compute_type,
+            chat,
+            span,
+            logprobs,
+            model_id,
+            system_fingerprint,
+            n,
+        )
+        .await
+    }
+}
+
+/// Run a single chat completion (n == 1 path, fully backward compatible).
+#[allow(clippy::too_many_arguments)]
+async fn run_chat_single(
+    infer: Infer,
+    compute_type: ComputeType,
+    mut chat: ChatRequest,
+    span: tracing::Span,
+    stream: bool,
+    stream_options: StreamOptions,
+    logprobs: bool,
+    model_id: String,
+    system_fingerprint: String,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let id = chat.next_tool_call_id();
+    let (generate_request, using_tools): (GenerateRequest, bool) =
+        chat.clone().try_into_generate(&infer)?;
+    span.record("parameters", format!("{:?}", generate_request.parameters));
+
     if stream {
         let (headers, response_stream) = generate_stream_internal(
             infer.clone(),
@@ -1296,9 +1369,294 @@ pub(crate) async fn chat_completions(
             input_length,
         ));
 
-        // wrap generation inside a Vec to match api-inference
         Ok((headers, Json(response)).into_response())
     }
+}
+
+/// Run n parallel non-streaming chat completions.
+#[allow(clippy::too_many_arguments)]
+async fn run_chat_non_stream_n(
+    infer: Infer,
+    compute_type: ComputeType,
+    chat: ChatRequest,
+    span: tracing::Span,
+    logprobs: bool,
+    model_id: String,
+    system_fingerprint: String,
+    n: u32,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_secs();
+
+    // Fan out n independent chat generations in parallel.
+    let responses = futures::stream::FuturesUnordered::new();
+    for index in 0..n {
+        let infer_clone = infer.clone();
+        let compute_type_clone = compute_type.clone();
+        let chat_clone = chat.clone();
+        let span_clone = span.clone();
+
+        let response_future = async move {
+            run_single_chat_non_stream(
+                infer_clone,
+                compute_type_clone,
+                chat_clone,
+                span_clone,
+                index,
+            )
+            .await
+        };
+        responses.push(response_future);
+    }
+
+    let per_results: Vec<_> = responses.try_collect().await?;
+
+    let mut choices = Vec::with_capacity(n as usize);
+    let mut prompt_tokens_total = 0u32;
+    let mut completion_tokens_total = 0u32;
+    let mut headers = HeaderMap::new();
+
+    for (index, h, input_length, generation) in per_results {
+        let details = generation.details.ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "No details in generation".to_string(),
+                error_type: "no details".to_string(),
+            }),
+        ))?;
+
+        if headers.is_empty() {
+            headers = h.clone();
+        }
+
+        prompt_tokens_total += input_length;
+        completion_tokens_total += details.generated_tokens;
+
+        let choice = build_chat_choice(
+            index,
+            Some(generation.generated_text),
+            details,
+            logprobs,
+            None,
+        );
+        choices.push(choice);
+    }
+
+    let response = CompletionType::ChatCompletion(ChatCompletion::new_with_choices(
+        model_id,
+        system_fingerprint,
+        current_time,
+        choices,
+        prompt_tokens_total,
+        completion_tokens_total,
+    ));
+
+    Ok((headers, Json(response)).into_response())
+}
+
+/// Run a single non-streaming chat generation (raw components for aggregation).
+async fn run_single_chat_non_stream(
+    infer: Infer,
+    compute_type: ComputeType,
+    chat: ChatRequest,
+    span: tracing::Span,
+    index: u32,
+) -> Result<
+    (u32, HeaderMap, u32, GenerateResponse),
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let (_headers, input_length, Json(generation)) = generate_internal(
+        Extension(infer.clone()),
+        compute_type.clone(),
+        {
+            let (generate_request, _using_tools) = chat.clone().try_into_generate(&infer)?;
+            Json(generate_request)
+        },
+        span.clone(),
+    )
+    .await?;
+
+    // Note: tool-call retry is not handled in the fan-out inner function.
+    // For simplicity we return the raw generation text. Tool call support
+    // with n > 1 can be added as an enhancement.
+    let headers = HeaderMap::new();
+
+    Ok((index, headers, input_length, generation))
+}
+
+/// Run n parallel streaming chat completions.
+#[allow(clippy::too_many_arguments)]
+async fn run_chat_stream_n(
+    infer: Infer,
+    compute_type: ComputeType,
+    chat: ChatRequest,
+    span: tracing::Span,
+    stream_options: StreamOptions,
+    logprobs: bool,
+    model_id: String,
+    system_fingerprint: String,
+    n: u32,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    use tokio::sync::oneshot;
+    use tokio::sync::mpsc;
+
+    let mut response_streams = FuturesOrdered::new();
+    for index in 0..n {
+        let model_id_clone = model_id.clone();
+        let fingerprint_clone = system_fingerprint.clone();
+        let infer_clone = infer.clone();
+        let compute_type_clone = compute_type.clone();
+        let span_clone = span.clone();
+        let stream_options_clone = stream_options.clone();
+        let chat_clone = chat.clone();
+
+        let generate_future = async move {
+            let (header_tx, header_rx) = oneshot::channel();
+            let (sse_tx, sse_rx) = mpsc::unbounded_channel();
+
+            tokio::spawn(async move {
+                let index = index;
+                let mut chat_inner = chat_clone;
+                let logprobs = logprobs;
+
+                let id = chat_inner.next_tool_call_id();
+                let (generate_request, mut using_tools): (GenerateRequest, bool) =
+                    match chat_inner.clone().try_into_generate(&infer_clone) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = sse_tx.send(Ok(e.into_openai_event()));
+                            return;
+                        }
+                    };
+
+                let (_headers, response_stream) = generate_stream_internal(
+                    infer_clone.clone(),
+                    compute_type_clone.clone(),
+                    Json(generate_request),
+                    span_clone.clone(),
+                )
+                .await;
+
+                let _ = header_tx.send(HeaderMap::new());
+
+                let mut state = ChatState::new(
+                    using_tools,
+                    stream_options_clone.clone(),
+                    fingerprint_clone.clone(),
+                    model_id_clone.clone(),
+                    logprobs,
+                    id.clone(),
+                );
+
+                let mut response_stream = Box::pin(response_stream);
+                while let Some(result) = response_stream.next().await {
+                    match result {
+                        Ok(stream_token) => {
+                            let events = state.push(stream_token);
+                            match events {
+                                ChatEvent::NoTool => {
+                                    chat_inner.tools = None;
+                                    chat_inner.response_format = None;
+                                    let (gr, ut): (GenerateRequest, bool) =
+                                        chat_inner.clone().try_into_generate(&infer_clone).unwrap();
+                                    assert!(!ut);
+                                    let (_h, rs2) = generate_stream_internal(
+                                        infer_clone.clone(),
+                                        compute_type_clone.clone(),
+                                        Json(gr),
+                                        span_clone.clone(),
+                                    )
+                                    .await;
+                                    using_tools = ut;
+                                    state = ChatState::new(
+                                        using_tools,
+                                        stream_options_clone.clone(),
+                                        fingerprint_clone.clone(),
+                                        model_id_clone.clone(),
+                                        logprobs,
+                                        id.clone(),
+                                    );
+                                    response_stream = Box::pin(rs2);
+                                }
+                                ChatEvent::Events(events) => {
+                                    for mut chat_complete in events {
+                                        match &mut chat_complete {
+                                            CompletionType::ChatCompletionChunk(ref mut chunk) => {
+                                                for choice in &mut chunk.choices {
+                                                    choice.index = index;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        let event = Event::default()
+                                            .json_data(&chat_complete)
+                                            .unwrap_or_else(|e| {
+                                                tracing::error!(
+                                                    "Failed to serialize chunk: {:?}",
+                                                    e
+                                                );
+                                                Event::default()
+                                            });
+                                        if sse_tx.send(Ok::<_, Infallible>(event)).is_err() {
+                                            tracing::error!("Receiver dropped.");
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if sse_tx.send(Ok(err.into_openai_event())).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+
+            (header_rx, sse_rx)
+        };
+        response_streams.push_back(generate_future);
+    }
+
+    let mut all_rxs: Vec<mpsc::UnboundedReceiver<Result<Event, Infallible>>> = vec![];
+    while let Some((_header_rx, sse_rx)) = response_streams.next().await {
+        all_rxs.push(sse_rx);
+    }
+
+    let headers = HeaderMap::new();
+
+    // Merge all SSE streams, preserving interleaving order.
+    let stream: AsyncStream<Result<Event, Infallible>, _> = async_stream::stream! {
+        loop {
+            let mut i = 0;
+            while i < all_rxs.len() {
+                let rx = &mut all_rxs[i];
+                tokio::select! {
+                    Some(event) = rx.recv() => {
+                        yield event;
+                    }
+                    else => {
+                        all_rxs.remove(i);
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            if all_rxs.is_empty() {
+                break;
+            }
+        }
+    };
+
+    let stream = stream.chain(futures::stream::once(async {
+        Ok::<Event, Infallible>(Event::default().data("[DONE]"))
+    }));
+
+    let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+    Ok((headers, sse).into_response())
 }
 
 /// Tokenize inputs
