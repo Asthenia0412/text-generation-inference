@@ -707,13 +707,7 @@ impl ChatCompletion {
         prompt_tokens: u32,
     ) -> Self {
         let completion_tokens = details.generated_tokens;
-        let choice = build_chat_choice(
-            0,
-            output,
-            details,
-            return_logprobs,
-            tool_calls,
-        );
+        let choice = build_chat_choice(0, output, details, return_logprobs, tool_calls);
         Self {
             id: String::new(),
             created,

@@ -15,12 +15,12 @@ use crate::sagemaker::{
 use crate::validation::ValidationError;
 use crate::vertex::vertex_compatibility;
 use crate::{
-    usage_stats, BestOfSequence, build_chat_choice, Details, ErrorResponse, FinishReason,
-    FunctionName, GenerateParameters, GenerateRequest, GenerateResponse, GrammarType,
-    HubModelInfo, HubProcessorConfig, HubTokenizerConfig, Info, Message, MessageChunk,
-    MessageContent, OutputMessage, PrefillToken, SimpleToken, StreamDetails, StreamOptions,
-    StreamResponse, TextMessage, Token, TokenizeResponse, Tokenizer, ToolCallDelta,
-    ToolCallMessage, Url, Usage, Validation,
+    build_chat_choice, usage_stats, BestOfSequence, Details, ErrorResponse, FinishReason,
+    FunctionName, GenerateParameters, GenerateRequest, GenerateResponse, GrammarType, HubModelInfo,
+    HubProcessorConfig, HubTokenizerConfig, Info, Message, MessageChunk, MessageContent,
+    OutputMessage, PrefillToken, SimpleToken, StreamDetails, StreamOptions, StreamResponse,
+    TextMessage, Token, TokenizeResponse, Tokenizer, ToolCallDelta, ToolCallMessage, Url, Usage,
+    Validation,
 };
 use crate::{
     ChatCompletion, ChatCompletionChoice, ChatCompletionChunk, ChatCompletionComplete,
@@ -1413,10 +1413,13 @@ async fn run_chat_non_stream_n(
 
     let per_results: Vec<_> = responses.try_collect().await?;
 
-    let mut choices = Vec::with_capacity(n as usize);
     let mut prompt_tokens_total = 0u32;
     let mut completion_tokens_total = 0u32;
     let mut headers = HeaderMap::new();
+
+    // FuturesUnordered yields results in completion order, not submission order,
+    // so we must sort choices by index before building the final response.
+    let mut indexed_choices: Vec<(u32, ChatCompletionComplete)> = Vec::new();
 
     for (index, h, input_length, generation) in per_results {
         let details = generation.details.ok_or((
@@ -1441,8 +1444,12 @@ async fn run_chat_non_stream_n(
             logprobs,
             None,
         );
-        choices.push(choice);
+        indexed_choices.push((index, choice));
     }
+
+    indexed_choices.sort_by_key(|(idx, _)| *idx);
+    let choices: Vec<ChatCompletionComplete> =
+        indexed_choices.into_iter().map(|(_, c)| c).collect();
 
     let response = CompletionType::ChatCompletion(ChatCompletion::new_with_choices(
         model_id,
@@ -1463,11 +1470,8 @@ async fn run_single_chat_non_stream(
     chat: ChatRequest,
     span: tracing::Span,
     index: u32,
-) -> Result<
-    (u32, HeaderMap, u32, GenerateResponse),
-    (StatusCode, Json<ErrorResponse>),
-> {
-    let (_headers, input_length, Json(generation)) = generate_internal(
+) -> Result<(u32, HeaderMap, u32, GenerateResponse), (StatusCode, Json<ErrorResponse>)> {
+    let (headers, input_length, Json(generation)) = generate_internal(
         Extension(infer.clone()),
         compute_type.clone(),
         {
@@ -1481,7 +1485,6 @@ async fn run_single_chat_non_stream(
     // Note: tool-call retry is not handled in the fan-out inner function.
     // For simplicity we return the raw generation text. Tool call support
     // with n > 1 can be added as an enhancement.
-    let headers = HeaderMap::new();
 
     Ok((index, headers, input_length, generation))
 }
@@ -1499,8 +1502,8 @@ async fn run_chat_stream_n(
     system_fingerprint: String,
     n: u32,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    use tokio::sync::oneshot;
     use tokio::sync::mpsc;
+    use tokio::sync::oneshot;
 
     let mut response_streams = FuturesOrdered::new();
     for index in 0..n {
@@ -1582,13 +1585,12 @@ async fn run_chat_stream_n(
                                 }
                                 ChatEvent::Events(events) => {
                                     for mut chat_complete in events {
-                                        match &mut chat_complete {
-                                            CompletionType::ChatCompletionChunk(ref mut chunk) => {
-                                                for choice in &mut chunk.choices {
-                                                    choice.index = index;
-                                                }
+                                        if let CompletionType::ChatCompletionChunk(ref mut chunk) =
+                                            &mut chat_complete
+                                        {
+                                            for choice in &mut chunk.choices {
+                                                choice.index = index;
                                             }
-                                            _ => {}
                                         }
                                         let event = Event::default()
                                             .json_data(&chat_complete)
